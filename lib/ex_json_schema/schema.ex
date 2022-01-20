@@ -12,8 +12,7 @@ defmodule ExJsonSchema.Schema do
   end
 
   defmodule UndefinedRemoteSchemaResolverError do
-    defexception message:
-                   "trying to resolve a remote schema but no remote schema resolver function is defined"
+    defexception message: "trying to resolve a remote schema but no remote schema resolver function is defined"
   end
 
   defmodule InvalidReferenceError do
@@ -27,11 +26,7 @@ defmodule ExJsonSchema.Schema do
   alias ExJsonSchema.Validator
 
   @type ref_path :: [:root | String.t()]
-  @type resolved ::
-          ExJsonSchema.data()
-          | %{String.t() => (Root.t() -> {Root.t(), resolved}) | ref_path}
-          | true
-          | false
+  @type resolved :: ExJsonSchema.data() | %{String.t() => (Root.t() -> {Root.t(), resolved}) | ref_path} | true | false
   @type invalid_reference_error :: {:error, :invalid_reference}
 
   @current_draft_schema_url "http://json-schema.org/schema"
@@ -39,18 +34,15 @@ defmodule ExJsonSchema.Schema do
   @draft6_schema_url "http://json-schema.org/draft-06/schema"
   @draft7_schema_url "http://json-schema.org/draft-07/schema"
 
+  @ignored_properties ["const", "default", "enum", "examples"]
+
   @spec decode_json(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def decode_json(json) do
-    decoder =
-      Application.get_env(:ex_json_schema, :decode_json) ||
-        fn _json -> raise MissingJsonDecoderError end
-
+    decoder = Application.get_env(:ex_json_schema, :decode_json) || fn _json -> raise MissingJsonDecoderError end
     decoder.(json)
   end
 
-  @spec resolve(boolean | Root.t() | ExJsonSchema.object(),
-          custom_format_validator: {module(), atom()}
-        ) ::
+  @spec resolve(boolean | Root.t() | ExJsonSchema.object(), custom_format_validator: {module(), atom()}) ::
           Root.t() | no_return
   def resolve(schema, options \\ [])
 
@@ -76,17 +68,23 @@ defmodule ExJsonSchema.Schema do
     end
   end
 
-  def get_fragment(root = %Root{}, [:root | path] = ref) do
-    do_get_fragment(root.schema, path, ref)
+  def get_fragment(root = %Root{refs: refs}, [:root | path] = ref) do
+    case Map.get(refs, ref_to_string(ref)) do
+      nil -> do_get_fragment(root.schema, path, ref)
+      schema -> {:ok, schema}
+    end
   end
 
-  def get_fragment(root = %Root{}, [url | path] = ref) when is_binary(url) do
-    do_get_fragment(root.refs[url], path, ref)
+  def get_fragment(root = %Root{refs: refs}, [url | path] = ref) when is_binary(url) do
+    case Map.get(refs, ref_to_string(ref)) do
+      nil -> do_get_fragment(root.refs[url], path, ref)
+      schema -> {:ok, schema}
+    end
   end
 
   @spec get_fragment!(Root.t(), ref_path | ExJsonSchema.json_path()) :: resolved | no_return
-  def get_fragment!(schema, ref) do
-    case get_fragment(schema, ref) do
+  def get_fragment!(root, ref) do
+    case get_fragment(root, ref) do
       {:ok, schema} -> schema
       {:error, :invalid_reference} -> raise_invalid_reference_error(ref)
     end
@@ -129,10 +127,35 @@ defmodule ExJsonSchema.Schema do
           message: "schema did not pass validation against its meta-schema: #{inspect(errors)}"
     end
 
+    root = %Root{root | version: schema_version}
     {root, schema} = resolve_with_root(root, root_schema)
 
-    %Root{root | schema: schema, version: schema_version}
+    %Root{root | schema: schema}
+    |> resolve_refs(schema)
   end
+
+  defp resolve_refs(%Root{} = root, schema) when is_map(schema) do
+    schema
+    |> Enum.reduce(root, fn
+      {"$ref", [:root | _]}, root ->
+        root
+
+      {"$ref", [url | _]}, root ->
+        resolve_and_cache_remote_schema(root, url)
+
+      {_, value}, root when is_map(value) ->
+        resolve_refs(root, value)
+
+      {_, values}, root when is_list(values) ->
+        values
+        |> Enum.reduce(root, fn value, root -> resolve_refs(root, value) end)
+
+      _, root ->
+        root
+    end)
+  end
+
+  defp resolve_refs(%Root{} = root, _), do: root
 
   defp schema_version!(schema_url) do
     case schema_module(schema_url, :error) do
@@ -168,25 +191,30 @@ defmodule ExJsonSchema.Schema do
 
   defp resolve_with_root(root, schema, scope \\ "")
 
+  defp resolve_with_root(root, %{"$ref" => ref}, scope) when is_binary(ref) do
+    do_resolve(root, %{"$ref" => ref}, scope)
+  end
+
   defp resolve_with_root(root, schema = %{"$id" => id}, scope) when is_binary(id) do
-    resolve_id(root, schema, scope, id)
+    resolve_with_id(root, schema, scope, id)
   end
 
   defp resolve_with_root(root, schema = %{"id" => id}, scope) when is_binary(id) do
-    resolve_id(root, schema, scope, id)
+    resolve_with_id(root, schema, scope, id)
   end
 
   defp resolve_with_root(root, schema = %{}, scope), do: do_resolve(root, schema, scope)
   defp resolve_with_root(root, non_schema, _scope), do: {root, non_schema}
 
-  defp resolve_id(root, schema, scope, id) do
+  defp resolve_with_id(root, schema, scope, id) do
     scope =
       case URI.parse(scope) do
         %URI{host: nil} -> id
         uri -> uri |> URI.merge(id) |> to_string()
       end
 
-    do_resolve(root, schema, scope)
+    {root, schema} = do_resolve(root, schema, scope)
+    {root_with_ref(root, scope, schema), schema}
   end
 
   defp do_resolve(root, schema, scope) do
@@ -199,12 +227,12 @@ defmodule ExJsonSchema.Schema do
     {root, schema |> sanitize_attributes()}
   end
 
-  defp resolve_property(root, {key, value}, scope) when is_map(value) do
+  defp resolve_property(root, {key, value}, scope) when is_map(value) and key not in @ignored_properties do
     {root, resolved} = resolve_with_root(root, value, scope)
     {root, {key, resolved}}
   end
 
-  defp resolve_property(root, {key, values}, scope) when is_list(values) do
+  defp resolve_property(root, {key, values}, scope) when is_list(values) and key not in @ignored_properties do
     {root, values} =
       Enum.reduce(values, {root, []}, fn value, {root, values} ->
         {root, resolved} = resolve_with_root(root, value, scope)
@@ -214,19 +242,13 @@ defmodule ExJsonSchema.Schema do
     {root, {key, Enum.reverse(values)}}
   end
 
-  defp resolve_property(root, {"$ref", ref}, scope) do
-    scoped_ref =
-      case URI.parse(ref) do
-        # TODO: this special case is only needed until there is proper support for URL references
-        # that point to a local schema (via scope changes)
-        %URI{host: nil, path: nil} = uri ->
-          to_string(uri)
+  defp resolve_property(root, {"$ref", ref}, scope) when is_binary(ref) do
+    ref_uri = URI.parse(ref)
 
-        ref_uri ->
-          case URI.parse(scope) do
-            %URI{host: nil} -> ref
-            scope_uri -> URI.merge(scope_uri, ref_uri) |> to_string()
-          end
+    scoped_ref =
+      case URI.parse(scope) do
+        %URI{host: nil} -> ref
+        scope_uri -> URI.merge(scope_uri, ref_uri) |> to_string()
       end
 
     {root, path} = resolve_ref!(root, scoped_ref)
@@ -244,10 +266,11 @@ defmodule ExJsonSchema.Schema do
     ref_path = validate_ref_path(anchor, ref)
     {root, path} = root_and_path_for_url(root, ref_path, url)
 
-    case get_fragment(root, path) do
-      {:ok, _schema} -> {:ok, {root, path}}
-      error -> error
-    end
+    {:ok, {root, path}}
+    # case get_fragment(root, path) do
+    #   {:ok, _schema} -> {:ok, {root, path}}
+    #   error -> error
+    # end
   end
 
   defp resolve_ref!(root, ref) do
@@ -259,7 +282,7 @@ defmodule ExJsonSchema.Schema do
 
   defp validate_ref_path([], _), do: nil
   defp validate_ref_path([""], _), do: nil
-  defp validate_ref_path([fragment = "/" <> _], _), do: fragment
+  defp validate_ref_path([fragment], _) when is_binary(fragment), do: fragment
   defp validate_ref_path(_, ref), do: raise_invalid_reference_error(ref)
 
   defp root_and_path_for_url(root, fragment, "") do
@@ -267,7 +290,7 @@ defmodule ExJsonSchema.Schema do
   end
 
   defp root_and_path_for_url(root, fragment, url) do
-    root = resolve_and_cache_remote_schema(root, url)
+    # root = resolve_and_cache_remote_schema(root, url)
     {root, [url | relative_path(fragment)]}
   end
 
@@ -275,7 +298,7 @@ defmodule ExJsonSchema.Schema do
   defp relative_path(fragment), do: relative_ref_path(fragment)
 
   defp relative_ref_path(ref) do
-    ["" | keys] = unescaped_ref_segments(ref)
+    keys = unescaped_ref_segments(ref)
 
     Enum.map(keys, fn key ->
       case key =~ ~r/^\d+$/ do
@@ -306,7 +329,7 @@ defmodule ExJsonSchema.Schema do
 
   defp resolve_remote_schema(root, url, remote_schema) do
     root = root_with_ref(root, url, remote_schema)
-    resolved_root = resolve_root(%{root | schema: remote_schema, location: url})
+    resolved_root = resolve_root(%Root{root | schema: remote_schema, location: url})
     root = %{root | refs: resolved_root.refs}
     root_with_ref(root, url, resolved_root.schema)
   end
@@ -365,6 +388,7 @@ defmodule ExJsonSchema.Schema do
   defp unescaped_ref_segments(ref) do
     ref
     |> String.split("/")
+    |> Enum.reject(&(&1 == ""))
     |> Enum.map(fn segment ->
       segment
       |> String.replace("~0", "~")
@@ -385,8 +409,9 @@ defmodule ExJsonSchema.Schema do
   defp do_get_fragment(nil, _, _ref), do: {:error, :invalid_reference}
   defp do_get_fragment(schema, [], _), do: {:ok, schema}
 
-  defp do_get_fragment(schema, [key | path], ref) when is_binary(key),
-    do: do_get_fragment(Map.get(schema, key), path, ref)
+  defp do_get_fragment(schema, [key | path], ref) when is_binary(key) do
+    do_get_fragment(Map.get(schema, key), path, ref)
+  end
 
   defp do_get_fragment(schema, [idx | path], ref) when is_integer(idx) do
     try do
@@ -416,8 +441,8 @@ defmodule ExJsonSchema.Schema do
     |> get_ref_schema_with_schema(path, ref)
   end
 
-  defp ref_to_string([:root | path]), do: ["#" | path] |> Enum.join("/")
-  defp ref_to_string([url | path]), do: [url <> "#" | path] |> Enum.join("/")
+  defp ref_to_string([:root | path]), do: "##{path}"
+  defp ref_to_string([url | path]), do: url <> "#" <> Enum.join(path, "/")
 
   @spec raise_invalid_reference_error(any) :: no_return
   def raise_invalid_reference_error(ref) when is_binary(ref),
